@@ -3,6 +3,7 @@ import sqlite3
 import hashlib
 import os
 import random
+import sys
 
 
 class App:
@@ -295,5 +296,5 @@ class App:
         return jsonify(ok=True, message="World found"), 200
     
     def run(self):
-        
+        if sys.platform.startswith("linux"): return
         self.app.run()
