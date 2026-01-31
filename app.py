@@ -11,10 +11,10 @@ from typing import TypedDict
 from pathlib import Path
 from datetime import datetime, timedelta
 from flask_cors import CORS
+from secret_key import SECRET_KEY
 
 ADMIN_USERNAME = "$argon2id$v=19$m=262144,t=6,p=4$9K5BLdDU2RRDslxij+wnVw$T+lEuuqudJKFWKrY20pfcUSA1hAAGzga02oSP+AqaRY"
 ADMIN_HASHED_PASSWORD = "$argon2id$v=19$m=262144,t=6,p=4$gvj5zf9Szcc2MNnpsKctWg$0I7QS/A2VIZPNPZr+4bhsBkLPMePUtkhwtGELoWyS1A"
-SECRET_KEY = "d23d87fag"
 
 ph = argon2.PasswordHasher()
 
@@ -173,7 +173,7 @@ class App:
         
         payload = {
             "id": random.randint(1000000, 9999999),
-            "exp": datetime.utcnow() + timedelta(minutes=15),
+            "exp": datetime.utcnow() + timedelta(minutes=1),
             "iat": datetime.utcnow()
         }
         
@@ -238,19 +238,28 @@ class App:
             returnedData: list[WorldDataStatisticsItem] = []
             
             for row in result:
+                
                 id = row[0]
-                
-                world_folder = os.path.join(self.base_dir, "objects", f"world_{id}")
-                
-                total_size = self._query_size_of_folder(world_folder)
-                last_modified_time = self._query_last_modified_date_folder(world_folder)
-                last_modified_time_str = human_readable_time(last_modified_time)
-                
-                returnedData.append({
-                    "id": id,
-                    "lastModifiedTime": last_modified_time_str,
-                    "size": total_size
-                })
+                try:
+                    world_folder = os.path.join(self.base_dir, "objects", f"world_{id}")
+                    
+                    total_size = self._query_size_of_folder(world_folder)
+                    last_modified_time = self._query_last_modified_date_folder(world_folder)
+                    last_modified_time_str = human_readable_time(last_modified_time)
+                    
+                    returnedData.append({
+                        "id": id,
+                        "lastModifiedTime": last_modified_time_str,
+                        "size": total_size
+                    })
+                except Exception as e:
+                    print(f"Failed to query details for: {id}")
+                    
+                    returnedData.append({
+                        "id": id,
+                        "lastModifiedTime": "Unknown",
+                        "size": 0
+                    })
             
             return jsonify(ok=True, data=returnedData), 200
         except Exception as e:
