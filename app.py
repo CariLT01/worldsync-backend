@@ -1,10 +1,55 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory, render_template
 import sqlite3
 import hashlib
 import os
 import random
+import jwt
 import sys
+import shutil
+import argon2
+from typing import TypedDict
+from pathlib import Path
+from datetime import datetime, timedelta
+from flask_cors import CORS
 
+ADMIN_USERNAME = "$argon2id$v=19$m=262144,t=6,p=4$9K5BLdDU2RRDslxij+wnVw$T+lEuuqudJKFWKrY20pfcUSA1hAAGzga02oSP+AqaRY"
+ADMIN_HASHED_PASSWORD = "$argon2id$v=19$m=262144,t=6,p=4$gvj5zf9Szcc2MNnpsKctWg$0I7QS/A2VIZPNPZr+4bhsBkLPMePUtkhwtGELoWyS1A"
+SECRET_KEY = "d23d87fag"
+
+ph = argon2.PasswordHasher()
+
+class WorldDataStatisticsItem(TypedDict):
+    
+    id: str
+    lastModifiedTime: str
+    size: int
+
+
+def human_readable_time(dt: datetime) -> str:
+    now = datetime.now()
+    diff = now - dt
+
+    seconds = diff.total_seconds()
+    minutes = seconds / 60
+    hours = seconds / 3600
+    days = seconds / 86400
+    months = days / 30
+    years = days / 365
+
+    if seconds < 60:
+        return "just now"
+    elif minutes < 60:
+        return f"{int(minutes)} minute{'s' if minutes >= 2 else ''} ago"
+    elif hours < 24:
+        return f"{int(hours)} hour{'s' if hours >= 2 else ''} ago"
+    elif days < 2:
+        return "Yesterday"
+    elif days < 30:
+        return f"{int(days)} day{'s' if days >= 2 else ''} ago"
+    elif months < 12:
+        return f"{int(months)} month{'s' if months >= 2 else ''} ago"
+    else:
+        return f"{int(years)} year{'s' if years >= 2 else ''} ago"
 
 class App:
     
@@ -14,8 +59,13 @@ class App:
             self.base_dir = "/home/mcworldsyncutils/mysite"
         else:
             self.base_dir = os.path.abspath(os.path.dirname(__file__))
+            
+        print(f"Templates directory: {os.path.join(self.base_dir, "templates")}")
 
-        self.app = Flask(__name__)
+        self.app = Flask(__name__, template_folder=os.path.join(self.base_dir, "templates"))
+        CORS(self.app)
+        
+        self.revoked_tokens: set[int] = set()
         
         self._initialize_database()
         
@@ -23,8 +73,22 @@ class App:
         self.app.add_url_rule("/remove", view_func=self._on_remove_data, methods=["DELETE"])
         self.app.add_url_rule("/get_data", view_func=self._on_get_server_world_data, methods=["GET"])
         self.app.add_url_rule("/create", view_func=self._on_create_world, methods=["POST"])
+        self.app.add_url_rule("/delete_world", view_func=self._on_delete_world, methods=["DELETE"])
         self.app.add_url_rule("/exists", view_func=self._on_does_world_exist, methods=["GET"])
         self.app.add_url_rule("/download", view_func=self._on_download_file, methods=["GET"])
+        self.app.add_url_rule("/api/worlds", view_func=self._query_worlds, methods=["GET"])
+        self.app.add_url_rule("/api/login", view_func=self._login, methods=["POST"])
+        self.app.add_url_rule("/manage", view_func=self._manage, methods=["GET"])
+        self.app.add_url_rule("/api/revoke_token", view_func=self._revoke_token, methods=["GET"])
+        
+        self.app.add_url_rule("/assets/<path:filename>", view_func=self._serve_assets, methods=["GET"])
+        
+    def _manage(self):
+        
+        return render_template("index.html")  
+    
+    def _serve_assets(self, filename):
+        return send_from_directory(os.path.join(self.base_dir, "static/assets"), filename)
         
     """
     PLEASE DON'T FORGET TO CALL .CLOSE() ON THE CONNECTION ONCE YOU ARE DONE, THANKS!!!
@@ -41,6 +105,195 @@ class App:
         cursor.execute("CREATE TABLE IF NOT EXISTS worlds (id INTEGER PRIMARY KEY)")
         conn.commit()
         conn.close()
+    
+    def _revoke_token(self):
+        
+        token = request.args.get("token")
+        
+        if not token:
+            return jsonify(ok=False, message="No token provided"), 400
+        
+        if not self._is_token_valid(token):
+            return jsonify(ok=False, message="Invalid token"), 401
+        
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        id = payload.get("id")
+        
+        if id == None:
+            return jsonify(ok=False, message="Invalid token"), 401
+        
+
+        self.revoked_tokens.add(id)
+        
+        return jsonify(ok=True, message="Token revoked"), 200
+        
+        
+    
+    def _on_delete_world(self):
+        world = request.args.get("world")
+        if not world:
+            return jsonify(ok=False, message="No world ID provided"), 400
+
+        token = request.args.get("token")
+        if not token:
+            return jsonify(ok=False, message="No token provided"), 400
+
+        if not self._is_token_valid(token):
+            return jsonify(ok=False, message="Invalid token"), 401
+
+
+        # Sanitize the world ID: allow only digits
+        if not world.isdigit():
+            return jsonify(ok=False, message="Invalid world ID"), 400
+
+        world_path = os.path.join(self.base_dir, "objects", f"world_{world}")
+        
+        # Ensure the path is within base_dir to prevent traversal
+        if not os.path.commonpath([self.base_dir, world_path]).startswith(self.base_dir):
+            return jsonify(ok=False, message="Invalid world path"), 400
+
+        if not os.path.exists(world_path):
+            return jsonify(ok=False, message="World not found"), 404
+
+        try:
+            # Delete database entry first
+            conn, cursor = self._get_db()
+            cursor.execute("DELETE FROM worlds WHERE id = ?", (world,))
+            conn.commit()
+            conn.close()
+
+            # Recursively delete folder
+            shutil.rmtree(world_path)
+        except Exception as e:
+            return jsonify(ok=False, message=f"Error deleting world: {e}"), 500
+
+        return jsonify(ok=True, message="World deleted"), 200
+    
+    def _issue_jwt(self):
+        
+        payload = {
+            "id": random.randint(1000000, 9999999),
+            "exp": datetime.utcnow() + timedelta(minutes=15),
+            "iat": datetime.utcnow()
+        }
+        
+        token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+        
+        return token
+    
+    def _is_token_valid(self, token: str):
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            id = payload.get("id")
+            if id == None:
+                return False            
+            if id in self.revoked_tokens:
+                return False
+            return True
+        except jwt.ExpiredSignatureError:
+            return False
+        except jwt.InvalidTokenError:
+            return False
+    
+    
+    
+    def _query_size_of_folder(self, path: str):
+        
+        total_size = 0
+        
+        for name in os.listdir(path):
+            
+            child_path = os.path.join(path, name)
+            total_size += os.path.getsize(child_path)
+        
+        return total_size
+    
+    def _query_last_modified_date_folder(self, path: str):
+        
+        folder = Path(path)
+        
+        latest_mtime = max(
+            child.stat().st_mtime
+            for child in folder.iterdir()
+        )
+        
+        return datetime.fromtimestamp(latest_mtime)
+        
+    
+    def _query_worlds(self):
+        try:
+            
+            token = request.args.get("token")
+            if token == None:
+                return jsonify(ok=False, message="No token provided"), 400
+            
+            if not self._is_token_valid(token):
+                return jsonify(ok=False, message="Invalid token"), 401
+            
+            conn, cursor = self._get_db()
+            cursor.execute("SELECT id FROM worlds")
+            result = cursor.fetchall()
+            conn.close()
+            
+            returnedData: list[WorldDataStatisticsItem] = []
+            
+            for row in result:
+                id = row[0]
+                
+                world_folder = os.path.join(self.base_dir, "objects", f"world_{id}")
+                
+                total_size = self._query_size_of_folder(world_folder)
+                last_modified_time = self._query_last_modified_date_folder(world_folder)
+                last_modified_time_str = human_readable_time(last_modified_time)
+                
+                returnedData.append({
+                    "id": id,
+                    "lastModifiedTime": last_modified_time_str,
+                    "size": total_size
+                })
+            
+            return jsonify(ok=True, data=returnedData), 200
+        except Exception as e:
+            print(f"Error occurred: {e}")
+            return jsonify(ok=False, message="Internal Server Error"), 500
+            
+    def _login(self):
+        
+        data: dict = request.get_json()
+        
+        if not data:
+            return jsonify(ok=False, message="Missing JSON body"), 400
+        
+        username = data.get("username")
+        password = data.get("password")
+        
+        if not username or not password:
+            return jsonify(ok=False, message="Missing username or password"), 400
+        
+        isUsernameCorrect = False
+        isPasswordCorrect = False
+        
+        try:
+            ph.verify(ADMIN_USERNAME, username)
+            isUsernameCorrect = True
+        except argon2.exceptions.VerifyMismatchError:
+            print(f"Invalid credentials detected")
+            pass
+        try:
+            ph.verify(ADMIN_HASHED_PASSWORD, password)
+            isPasswordCorrect = True
+        except argon2.exceptions.VerifyMismatchError:
+            print(f"Invalid credentials detected")
+            pass
+        
+        if isUsernameCorrect == False or isPasswordCorrect == False:
+            return jsonify(ok=False, message="Invalid credentials"), 401
+        
+        token = self._issue_jwt()
+        
+        return jsonify(ok=True, message="Login successful", data=token), 200
+        
+        
     
     def _does_table_exist(self, name: str) -> bool:
         conn, cursor = self._get_db()
