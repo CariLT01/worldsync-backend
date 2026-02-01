@@ -79,6 +79,7 @@ class App:
         self.app.add_url_rule("/api/worlds", view_func=self._query_worlds, methods=["GET"])
         self.app.add_url_rule("/api/login", view_func=self._login, methods=["POST"])
         self.app.add_url_rule("/manage", view_func=self._manage, methods=["GET"])
+        self.app.add_url_rule("/", view_func=self._landing, methods=["GET"])
         self.app.add_url_rule("/api/revoke_token", view_func=self._revoke_token, methods=["GET"])
         
         self.app.add_url_rule("/assets/<path:filename>", view_func=self._serve_assets, methods=["GET"])
@@ -86,6 +87,9 @@ class App:
     def _manage(self):
         
         return render_template("index.html")  
+    
+    def _landing(self):
+        return render_template("landing.html")
     
     def _serve_assets(self, filename):
         return send_from_directory(os.path.join(self.base_dir, "static/assets"), filename)
