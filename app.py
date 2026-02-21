@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, send_file, send_from_directory, render_template
+from werkzeug.datastructures import FileStorage
 import sqlite3
 import hashlib
 import os
@@ -12,6 +13,13 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from flask_cors import CORS
 from secret_key import SECRET_KEY
+import secrets
+import string
+
+
+def generate_slug(length=5):
+    alphabet = string.ascii_letters + string.digits  # a-zA-Z0-9
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 ADMIN_USERNAME = "$argon2id$v=19$m=262144,t=6,p=4$9K5BLdDU2RRDslxij+wnVw$T+lEuuqudJKFWKrY20pfcUSA1hAAGzga02oSP+AqaRY"
 ADMIN_HASHED_PASSWORD = "$argon2id$v=19$m=262144,t=6,p=4$gvj5zf9Szcc2MNnpsKctWg$0I7QS/A2VIZPNPZr+4bhsBkLPMePUtkhwtGELoWyS1A"
@@ -68,28 +76,177 @@ class App:
         self.revoked_tokens: set[int] = set()
         
         self._initialize_database()
+        self._clean_database()
         
         self.app.add_url_rule("/upload", view_func=self._on_upload_data, methods=["POST"])
+        self.app.add_url_rule("/upload/batch", view_func=self._on_upload_data_batched, methods=["POST"])
         self.app.add_url_rule("/remove", view_func=self._on_remove_data, methods=["DELETE"])
+        self.app.add_url_rule("/remove/batch", view_func=self._on_remove_data_batched, methods=["POST"])
         self.app.add_url_rule("/get_data", view_func=self._on_get_server_world_data, methods=["GET"])
         self.app.add_url_rule("/create", view_func=self._on_create_world, methods=["POST"])
         self.app.add_url_rule("/delete_world", view_func=self._on_delete_world, methods=["DELETE"])
+        
         self.app.add_url_rule("/exists", view_func=self._on_does_world_exist, methods=["GET"])
         self.app.add_url_rule("/download", view_func=self._on_download_file, methods=["GET"])
         self.app.add_url_rule("/api/worlds", view_func=self._query_worlds, methods=["GET"])
         self.app.add_url_rule("/api/login", view_func=self._login, methods=["POST"])
+        self.app.add_url_rule("/api/create_redirect_url", view_func=self._create_redirect_url, methods=["POST"])
+        self.app.add_url_rule("/api/get_redirect_location", view_func=self._find_redirect_url, methods=["GET"])
         self.app.add_url_rule("/manage", view_func=self._manage, methods=["GET"])
         self.app.add_url_rule("/", view_func=self._landing, methods=["GET"])
         self.app.add_url_rule("/api/revoke_token", view_func=self._revoke_token, methods=["GET"])
+        self.app.add_url_rule("/r", view_func=self._redirect)
         
         self.app.add_url_rule("/assets/<path:filename>", view_func=self._serve_assets, methods=["GET"])
+    
+    def _clean_database(self):
         
+        print("running clean db job")
+        
+        conn, cursor = self._get_db()
+        
+        try:
+            
+            cursor.execute("SELECT * FROM worlds")
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                id = int(row[0])
+                table_name = "world_" + str(id)
+                
+                # check if table exists
+                
+                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                table_exists = cursor.fetchone() is not None
+                
+                if not table_exists:
+                    try:
+                        print(f"[ DELETE WORLD ] delete {table_name}. reason: table does not exist")
+                        cursor.execute("DELETE FROM worlds WHERE id = ?", (id,))
+                    except Exception as e:
+                        print(f"delete world failed: {e}")
+                    continue
+                
+                # check if folder exists
+                
+                folder_path = os.path.join(self.base_dir, "objects", table_name)
+                folder_exists = os.path.exists(folder_path)
+                
+                if not folder_exists:
+                    try:
+                        print(f"[ DELETE WORLD ] delete {table_name}. reason: folder does not exist")
+                        # delete row
+                        cursor.execute("DELETE FROM worlds WHERE id = ?", (id,))
+                        # drop table if it exists
+                        print(f"[ DROP TABLE ] drop {table_name}, reason: folder does not exist")
+                        cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                    except Exception as e:
+                        print(f"delete world failed: {e}")
+                    continue
+                
+                # check if folder is empty
+                
+                folder_contents = os.listdir(folder_path)
+                if len(folder_contents) == 0:
+                    try:
+                        print(f"[ DELETE WORLD ] delete {table_name}. reason: folder is empty")
+                        # delete row
+                        cursor.execute("DELETE FROM worlds WHERE id = ?", (id,))
+                        # drop table if it exists
+                        print(f"[ DROP TABLE ] drop {table_name}, reason: folder is empty")
+                        cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                    except Exception as e:
+                        print(f"delete world failed: {e}")
+                    continue
+            
+            for row in rows:
+                id = int(row[0])
+                table_name = "world_" + str(id)
+                
+                if not self._does_table_exist(table_name):
+                    continue # cleaned up previously
+                
+                cursor.execute(f"SELECT * FROM {table_name}")
+                
+                for file in cursor.fetchall():
+                    id, path, hash = file
+                    
+                    # check if file exists, and remove row if it doesn't
+                    
+                    blob_path = os.path.join(self.base_dir, "objects", table_name, f"blob_{hash}.bin")
+                    if os.path.exists(blob_path) is False:
+                        # delete row
+                        try:
+                            cursor.execute(f"DELETE FROM {table_name} WHERE id = ?", (id,))
+                            print(f"[ DELETE ROW ] delete in {table_name} row {path} because it doesn't exist")
+                        except Exception as e:
+                            print(f"failed to delete row: {e}")
+                        continue
+                
+                # do the opposite, loop through all files, check if it exists in the table, and delete file if it doesn't
+                
+                folder_contents = os.listdir(os.path.join(self.base_dir, "objects", table_name))
+                for file in folder_contents:
+                    if file.startswith("blob_"):
+                        try:
+                            hash = file[5:-4]
+                            cursor.execute(f"SELECT * FROM {table_name} WHERE hash = ?", (hash,))
+                            if cursor.fetchone() is None:
+                                print(f"[ DELETE FILE ] delete in {table_name} filehash {hash} because it doesn't exist in table")
+                                os.remove(os.path.join(self.base_dir, "objects", table_name, file))
+                        except Exception as e:
+                            print(f"failed to delete file: {e}")
+                            
+                
+            for world in os.listdir(os.path.join(self.base_dir, "objects")):
+                if not world.startswith("world_"):
+                    continue
+                
+                # check if table exists
+                
+                if not self._does_table_exist(world):
+                    # delete row
+                    # print(f"[ DELETE WORLD ] delete {world}. reason: table does not exist")
+                    # cursor.execute(f"DROP TABLE IF EXISTS {world}")
+                    # delete from worlds if it exists
+                    
+                    try:
+                        shutil.rmtree(os.path.join(self.base_dir, "objects", world))
+                    except Exception as e:
+                        print("unused folder delete failed")
+                        print(e)
+                    
+                    print(f"DROP TABLE IF EXISTS: {world} reason: table does not exist")
+                    try:
+                        cursor.execute("DELETE FROM worlds WHERE id = ?", (int(world[6:]),))
+                    except Exception as e:
+                        print(f"cannot delete from row: {e}")
+                    continue
+        except Exception as e:
+            print(f"cleanup job failed: {e}")
+        conn.commit()
+        conn.close()
+        print("clean db job complete")
+        print("running vacumn job")
+        try:
+            conn, cursor = self._get_db()
+            cursor.execute("VACUUM")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"vacumn job failed: {e}")
+        print("vacumn job complete")
+        
+    
     def _manage(self):
         
         return render_template("index.html")  
     
     def _landing(self):
         return render_template("landing.html")
+    
+    def _redirect(self):
+        return render_template("redirect.html")
     
     def _serve_assets(self, filename):
         return send_from_directory(os.path.join(self.base_dir, "static/assets"), filename)
@@ -107,8 +264,63 @@ class App:
     def _initialize_database(self):
         conn, cursor = self._get_db()
         cursor.execute("CREATE TABLE IF NOT EXISTS worlds (id INTEGER PRIMARY KEY)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS shortened_urls (id INTEGER PRIMARY KEY, slug TEXT, url TEXT)")
         conn.commit()
         conn.close()
+
+    def _generate_unique_slug(self, cursor, length=5):
+        while True:
+            slug = generate_slug(length)
+            cursor.execute("SELECT 1 FROM shortened_urls WHERE slug=?", (slug,))
+            if not cursor.fetchone():
+                return slug
+
+    def _find_redirect_url(self):
+        slug_to_find = request.args.get("slug")
+        
+        conn, cursor = self._get_db()
+        
+        cursor.execute("SELECT url FROM shortened_urls WHERE slug = ?", (slug_to_find,))
+        row = cursor.fetchone()  # fetchone() returns None if no match
+
+        if row:
+            url = row[0]  # url is the first (and only) column selected
+            print(f"URL for slug {slug_to_find}: {url}")
+            return jsonify(ok=True, message="URL found", url=url), 200
+        else:
+            print(f"No URL found for slug {slug_to_find}")
+            return jsonify(ok=False, message="No URL found"), 404
+            
+        conn.close()
+
+    def _create_redirect_url(self):
+        data = request.get_json()
+        if not data:
+            return jsonify(ok=False, message="Missing JSON body"), 400
+        
+        url = data.get("url")
+        if not url:
+            return jsonify(ok=False, message="Missing URL"), 400
+        
+        username = data.get("username")
+        password = data.get("password")
+        if not username:
+            return jsonify(ok=False, message="Missing username"), 400
+        if not password:
+            return jsonify(ok=False, message="Missing password"), 400
+        
+        if not self._verify_credentials(username, password):
+            return jsonify(ok=False, message="Invalid credentials"), 401
+        
+        # Now write to database, generate a random slug
+        
+        conn, cursor = self._get_db()
+        slug = self._generate_unique_slug(cursor, length=7)
+        cursor.execute("INSERT INTO shortened_urls (slug, url) VALUES (?, ?)", (slug, url))
+        conn.commit()
+        conn.close()
+        
+        return jsonify(ok=True, message="URL created", url=f"/r?q={slug}&v2=true"), 200
     
     def _revoke_token(self):
         
@@ -269,20 +481,8 @@ class App:
         except Exception as e:
             print(f"Error occurred: {e}")
             return jsonify(ok=False, message="Internal Server Error"), 500
-            
-    def _login(self):
-        
-        data: dict = request.get_json()
-        
-        if not data:
-            return jsonify(ok=False, message="Missing JSON body"), 400
-        
-        username = data.get("username")
-        password = data.get("password")
-        
-        if not username or not password:
-            return jsonify(ok=False, message="Missing username or password"), 400
-        
+           
+    def _verify_credentials(self, username: str, password: str):
         isUsernameCorrect = False
         isPasswordCorrect = False
         
@@ -300,7 +500,25 @@ class App:
             pass
         
         if isUsernameCorrect == False or isPasswordCorrect == False:
+            return False
+        return True
+            
+    def _login(self):
+        
+        data: dict = request.get_json()
+        
+        if not data:
+            return jsonify(ok=False, message="Missing JSON body"), 400
+        
+        username = data.get("username")
+        password = data.get("password")
+        
+        if not username or not password:
+            return jsonify(ok=False, message="Missing username or password"), 400
+        
+        if not self._verify_credentials(username, password):
             return jsonify(ok=False, message="Invalid credentials"), 401
+
         
         token = self._issue_jwt()
         
@@ -365,24 +583,17 @@ class App:
         
         return send_file(path, as_attachment=True)
     
-    def _on_upload_data(self):
-        if "file" not in request.files:
-            return jsonify(ok=False, message="No file provided"), 400
-        
-        file = request.files["file"]
-        treepath = request.form.get("path")
-        worldid = request.form.get("world")
-        
-        if worldid == None:
+    def _insert_file(self, file: FileStorage, treepath: str | None, worldid: str | None):
+        if worldid is None:
             return jsonify(ok=False, message="No world ID provided"), 400
         
-        if treepath == None:
+        if treepath is None:
             return jsonify(ok=False, message="No path provided"), 400
         
         if file.filename == "":
             return jsonify(ok=False, message="No file provided"), 400
         
-        if self._does_table_exist(f"world_{worldid}") == False:
+        if self._does_table_exist(f"world_{worldid}") is False:
             return jsonify(ok=False, message="World not found"), 404
         
         table_name = f"world_{worldid}"
@@ -408,22 +619,34 @@ class App:
             
         conn.commit()
         conn.close()
+    
+    def _on_upload_data(self):
+        if "file" not in request.files:
+            return jsonify(ok=False, message="No file provided"), 400
+        
+        file = request.files["file"]
+        treepath = request.form.get("path")
+        worldid = request.form.get("world")
+        
+        self._insert_file(file, treepath, worldid)
+
             
-        return jsonify(ok=True, message="Uploaded"), 200    
+        return jsonify(ok=True, message="Uploaded"), 200
+    
+    def _on_upload_data_batched(self):
+        files = request.files.getlist("files")
+        paths = request.form.getlist("paths")
+        worldid = request.form.get("world")
+
+        if not files or len(files) != len(paths):
+            return jsonify(ok=False, message="Mismatched files and paths"), 400
         
-    def _on_remove_data(self):
-        id = request.args.get("world")
-        if id == None:
-            return jsonify(ok=False, message="No world ID provided"), 400
+        for file, treepath in zip(files, paths):
+            self._insert_file(file, treepath, worldid)
         
-        table_name = f"world_{id}"
-        if not self._does_table_exist(table_name):
-            return jsonify(ok=False, message="World not found"), 404
-        
-        file_path = request.args.get("path")
-        if file_path == None:
-            return jsonify(ok=False, message="No path provided"), 400
-        
+        return jsonify(ok=True, message="Uploaded"), 200
+    
+    def _remove_entry(self, table_name: str, file_path: str):
         conn, cursor = self._get_db()
         cursor.execute(f"""SELECT * FROM {table_name} WHERE path = ?""", (file_path,))
         row = cursor.fetchone()
@@ -447,6 +670,36 @@ class App:
         
         conn.commit()
         conn.close()
+    
+    def _on_remove_data_batched(self):
+        
+        paths = request.form.getlist("paths")
+        worldid = request.form.get("world")
+        
+        if not paths:
+            return jsonify(ok=False, message="No paths provided"), 400
+        
+        table_name = f"world_{worldid}"
+        
+        for path in paths:
+            self._remove_entry(table_name, path)
+        
+        return jsonify(ok=True, message="Files deleted"), 200
+    
+    def _on_remove_data(self):
+        id = request.args.get("world")
+        if id == None:
+            return jsonify(ok=False, message="No world ID provided"), 400
+        
+        table_name = f"world_{id}"
+        if not self._does_table_exist(table_name):
+            return jsonify(ok=False, message="World not found"), 404
+        
+        file_path = request.args.get("path")
+        if file_path == None:
+            return jsonify(ok=False, message="No path provided"), 400
+        
+        self._remove_entry(table_name, file_path)
         
         return jsonify(ok=True, message="File deleted"), 200
         
