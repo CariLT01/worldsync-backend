@@ -7,6 +7,7 @@ import random
 import jwt
 import sys
 import shutil
+import shutil
 import argon2
 from typing import TypedDict
 from pathlib import Path
@@ -92,6 +93,7 @@ class App:
         self.app.add_url_rule("/api/login", view_func=self._login, methods=["POST"])
         self.app.add_url_rule("/api/create_redirect_url", view_func=self._create_redirect_url, methods=["POST"])
         self.app.add_url_rule("/api/get_redirect_location", view_func=self._find_redirect_url, methods=["GET"])
+        self.app.add_url_rule("/api/get_free_space", view_func=self._get_free_space, methods=["GET"])
         self.app.add_url_rule("/manage", view_func=self._manage, methods=["GET"])
         self.app.add_url_rule("/", view_func=self._landing, methods=["GET"])
         self.app.add_url_rule("/api/revoke_token", view_func=self._revoke_token, methods=["GET"])
@@ -236,7 +238,10 @@ class App:
         except Exception as e:
             print(f"vacumn job failed: {e}")
         print("vacumn job complete")
-        
+    
+    def _get_free_space(self):
+        _total, _used, free = shutil.disk_usage(self.base_dir)
+        return jsonify(ok=True, message="OK", data=free)
     
     def _manage(self):
         
@@ -251,11 +256,12 @@ class App:
     def _serve_assets(self, filename):
         return send_from_directory(os.path.join(self.base_dir, "static/assets"), filename)
         
-    """
-    PLEASE DON'T FORGET TO CALL .CLOSE() ON THE CONNECTION ONCE YOU ARE DONE, THANKS!!!
-    WE DON'T WANT MEMORY LEAKS PLAGUING OUR SERVER!!!
-    """
+
     def _get_db(self):
+        """
+        PLEASE DON'T FORGET TO CALL .CLOSE() ON THE CONNECTION ONCE YOU ARE DONE, THANKS!!!
+        WE DON'T WANT MEMORY LEAKS PLAGUING OUR SERVER!!!
+        """
         db_path = os.path.join(self.base_dir, "database.db")
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
