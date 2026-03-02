@@ -7,8 +7,12 @@ import random
 import jwt
 import sys
 import shutil
+import json
 import shutil
+import lzma
+import io
 import argon2
+import threading
 from typing import TypedDict
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -35,6 +39,10 @@ class WorldDataStatisticsItem(TypedDict):
 
 
 def human_readable_time(dt: datetime) -> str:
+    """
+    Converts a datetime object to a human-readable string.
+    """
+    
     now = datetime.now()
     diff = now - dt
 
@@ -71,13 +79,20 @@ class App:
             
         print(f"Templates directory: {os.path.join(self.base_dir, "templates")}")
 
+        self.worlds_lock = threading.Lock()
+
         self.app = Flask(__name__, template_folder=os.path.join(self.base_dir, "templates"))
         CORS(self.app)
         
         self.revoked_tokens: set[int] = set()
         
         self._initialize_database()
-        self._clean_database()
+        self._enable_write_ahead_logging()
+        self._migrate_database()
+        self._run_deferred_tasks()
+        
+        
+
         
         self.app.add_url_rule("/upload", view_func=self._on_upload_data, methods=["POST"])
         self.app.add_url_rule("/upload/batch", view_func=self._on_upload_data_batched, methods=["POST"])
@@ -94,12 +109,43 @@ class App:
         self.app.add_url_rule("/api/create_redirect_url", view_func=self._create_redirect_url, methods=["POST"])
         self.app.add_url_rule("/api/get_redirect_location", view_func=self._find_redirect_url, methods=["GET"])
         self.app.add_url_rule("/api/get_free_space", view_func=self._get_free_space, methods=["GET"])
+        self.app.add_url_rule("/api/world/compression_info", view_func=self._get_world_files_compression_info, methods=["GET"])
         self.app.add_url_rule("/manage", view_func=self._manage, methods=["GET"])
         self.app.add_url_rule("/", view_func=self._landing, methods=["GET"])
         self.app.add_url_rule("/api/revoke_token", view_func=self._revoke_token, methods=["GET"])
         self.app.add_url_rule("/r", view_func=self._redirect)
         
         self.app.add_url_rule("/assets/<path:filename>", view_func=self._serve_assets, methods=["GET"])
+    
+    @staticmethod
+    def _get_last_modified_time_file_unix(file_path: str):
+        return int(os.stat(file_path).st_mtime)
+    
+    def _run_deferred_startup_tasks_task(self):
+        print("Run deferred tasks...")
+        try:
+            self.worlds_lock.acquire()
+            self._clean_database()
+            self._migrate_per_file_compressions()
+            self._detect_double_compression()
+        except Exception as e:
+            print(f"deferred tasks failed: {e}")
+        finally:
+            print("deferred tasks worlds lock released")
+            self.worlds_lock.release()
+        print("Deferred tasks complete")
+    
+    def _run_deferred_tasks(self):
+        
+        thread = threading.Thread(target=self._run_deferred_startup_tasks_task, daemon=True, name="DeferredStartupTasks-Thread")
+        thread.start()
+        print("Deferred tasks thread started")
+    
+    def _enable_write_ahead_logging(self):
+        conn = sqlite3.connect(os.path.join(self.base_dir, "database.db"))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.commit()
+        conn.close()
     
     def _clean_database(self):
         
@@ -171,8 +217,10 @@ class App:
                 cursor.execute(f"SELECT * FROM {table_name}")
                 
                 for file in cursor.fetchall():
-                    id, path, hash = file
-                    
+                    id = file[0]
+                    path = file[1]
+                    hash = file[2]
+
                     # check if file exists, and remove row if it doesn't
                     
                     blob_path = os.path.join(self.base_dir, "objects", table_name, f"blob_{hash}.bin")
@@ -263,7 +311,7 @@ class App:
         WE DON'T WANT MEMORY LEAKS PLAGUING OUR SERVER!!!
         """
         db_path = os.path.join(self.base_dir, "database.db")
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, isolation_level=None, timeout=30) # auto-commit, 30 second lock wait timeout
         cursor = conn.cursor()
         return (conn, cursor)
     
@@ -273,6 +321,148 @@ class App:
         cursor.execute("CREATE TABLE IF NOT EXISTS shortened_urls (id INTEGER PRIMARY KEY, slug TEXT, url TEXT)")
         conn.commit()
         conn.close()
+        
+    def _migrate_database(self):
+        try:
+            conn, cursor = self._get_db()
+            cursor.execute("ALTER TABLE worlds ADD COLUMN compressed INTEGER DEFAULT 0")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"database migration failed: {e}")
+    def _load_double_compression_cache(self) -> dict[str, int] | None:
+        cache_file_path = os.path.join(self.base_dir, "cache", "double_compression_cache.json")
+        if os.path.exists(cache_file_path) is False:
+            return None
+        with open(cache_file_path, "r") as f:
+            return json.load(f)
+    def _save_double_compression_cache(self, cache_data: dict[str, int]):
+        cache_file_path = os.path.join(self.base_dir, "cache", "double_compression_cache.json")
+        os.makedirs(os.path.dirname(cache_file_path), exist_ok=True)
+        with open(cache_file_path, "w") as f:
+            json.dump(cache_data, f)
+    
+    def _detect_double_compression(self):
+        # loop through every file in objects
+        conn, cursor = self._get_db()
+        cursor.execute("SELECT * FROM worlds")
+        rows = cursor.fetchall()
+        
+        print("Run double-compression detection")
+        
+        double_compression_cache = self._load_double_compression_cache() or {}
+        new_compression_cache: dict[str, int] = {}
+        
+        
+        for row in rows:
+            id = row[0]
+            table_name = f"world_{id}"
+            if self._does_table_exist(table_name) is False:
+                continue
+            try: 
+                cursor.execute(f"SELECT * FROM {table_name}")
+                files = cursor.fetchall()
+                for file in files:
+                    hash = file[2]
+                    # get file path
+                    file_path = os.path.join(self.base_dir, "objects", table_name, f"blob_{hash}.bin")
+                    if os.path.exists(file_path) is False:
+                        continue
+                    current_last_modified_time = self._get_last_modified_time_file_unix(file_path)
+                    new_compression_cache[file_path] = current_last_modified_time
+                    if double_compression_cache.get(file_path) is not None:
+                        cached_last_modified_time = double_compression_cache[file_path]
+                        if current_last_modified_time == cached_last_modified_time:
+                            print(f"Skipped double-compression check: {file_path}")
+                            continue
+                    
+                    
+                    
+                    
+                    # read
+                    with open(file_path, "rb") as f:
+                        file_data = f.read()
+                    
+                    # attempt first decompression
+                    try:
+                        decompressed_once = lzma.decompress(file_data)
+                    except lzma.LZMAError:
+                        continue  # file not compressed or corrupted, skip
+
+                    # attempt second decompression
+                    try:
+                        _ = lzma.decompress(decompressed_once)
+                    except lzma.LZMAError:
+                        print(f"double-compression not detected for {file_path}")
+                        continue  # only single compression, skip
+                    else:
+                        # Double compression detected, fix by keeping only one layer
+                        print(f"[FIX] Double compression detected for {file_path}")
+                        # recompress once if you want to keep compressed storage
+                        fixed_data = decompressed_once
+                        with open(file_path, "wb") as f:
+                            f.write(fixed_data)
+                        
+                        # update DB compressed flag to 1
+                        cursor.execute(
+                            f"UPDATE {table_name} SET compressed = 1 WHERE hash = ?",
+                            (hash,)
+                        )
+
+                
+            except Exception as e:
+                print(f"cannot add column: {e}")
+                continue
+        conn.close()
+        
+        self._save_double_compression_cache(new_compression_cache)
+        
+    def _migrate_per_file_compressions(self):
+        conn, cursor = self._get_db()
+        cursor.execute("SELECT * FROM worlds")
+        rows = cursor.fetchall()
+        
+        for row in rows:
+            id = row[0]
+            table_name = f"world_{id}"
+            if self._does_table_exist(table_name) is False:
+                continue
+            try:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN compressed INTEGER DEFAULT 0")
+                
+                cursor.execute(f"SELECT * FROM {table_name}")
+                files = cursor.fetchall()
+                for file in files:
+                    hash = file[2]
+                    # get file path
+                    file_path = os.path.join(self.base_dir, "objects", table_name, f"blob_{hash}.bin")
+                    if os.path.exists(file_path) is False:
+                        continue
+                    
+                    
+                    
+                    # read
+                    with open(file_path, "rb") as f:
+                        file_data = f.read()
+                    
+                    # compress
+                    isCompressed, processedData = self._compress_file(file_data)
+                    
+                    print(f"process: {file_path} compressed: {isCompressed}")
+                    
+                    # write
+                    with open(file_path, "wb") as f:
+                        f.write(processedData)
+                    
+                    cursor.execute(f"UPDATE {table_name} SET compressed = ? WHERE hash = ?", (isCompressed, hash))
+
+                
+            except Exception as e:
+                print(f"cannot add column: {e}")
+                continue
+        conn.close()
+    
+                
 
     def _generate_unique_slug(self, cursor, length=5):
         while True:
@@ -558,7 +748,9 @@ class App:
         returnedData = []
         for row in result:
             # By order: ID (int) Path (string) Hash (string)
-            id, path, hash = row
+            id = row[0]
+            path = row[1]
+            hash = row[2]
             returnedData.append(
                 {
                     "id": id,
@@ -574,9 +766,30 @@ class App:
         sha1.update(b)
         return sha1.hexdigest()
     
+    def _compress_file(self, fileData: bytes) -> tuple[bool, bytes]:
+        "Returns if file was compressed (0), and the compressed/uncompressed data (1)"
+        
+        compressedData = lzma.compress(fileData)
+        
+        compressionRatio = 1
+        if len(fileData) != 0:
+            compressionRatio = len(compressedData) / len(fileData)
+        
+        if compressionRatio >= 1:
+            # not worth to compress
+            print(f"Compression ratio: {compressionRatio} -- compression reversed")
+            return (False, fileData)
+        else:
+            print(f"Compression ratio: {compressionRatio} -- compression applied")
+            return (True, compressedData)
+    
+    def _decompress_file(self, fileData: bytes):
+        return lzma.decompress(fileData)
+    
     def _on_download_file(self):
         world_id = request.args.get("world")
         hash = request.args.get("blob")
+        client_supports_compression = request.args.get("client_supports_compression") == "true"
         
         if world_id == None or hash == None:
             return jsonify(ok=False, message="No world ID or hash provided"), 400
@@ -586,10 +799,80 @@ class App:
         
         if not os.path.exists(path):
             return jsonify(ok=False, message="File not found"), 404
-        
-        return send_file(path, as_attachment=True)
+        table_name = f"world_{world_id}"
+        if self._does_table_exist(table_name) is False:
+            return jsonify(ok=False, message="World not found"), 404
+        try:
+            print("wait for lock release (wait deferred tasks finished)")
+            self.worlds_lock.acquire()
+            # Find it in the database
+            conn, cursor = self._get_db()
+            # get row
+            cursor.execute(f"SELECT * FROM {table_name} WHERE hash = ?", (hash,))
+            row = cursor.fetchone()
+            if row == None:
+                return jsonify(ok=False, message="File not found")
+            
+            conn.close()
+            
+            # Read compressed data
+            with open(path, "rb") as f:
+                compressed_data = f.read()
+            
+            isCompressed = row[3]
+            decompressed_data = compressed_data
+            if client_supports_compression is False:
+                print(f"old client -- compression unsupported")
+                if isCompressed == 1:
+                    print(f"decompress")
+                    decompressed_data = self._decompress_file(compressed_data)
+                else:
+                    print(f"don't decompress: isCompressed = {isCompressed}")
+            else:
+                print(f"new client -- compression supported")
+
+            # Wrap in BytesIO so Flask can send it as a file
+            file_stream = io.BytesIO(decompressed_data)
+            
+            # Optionally, give the downloaded file a name
+            filename = "blob.bin"
+
+            return send_file(
+                file_stream,
+                as_attachment=True,
+                download_name=filename,
+                mimetype="application/octet-stream"
+            )
+        except Exception as e:
+            print(f"failed to send download: {e}")
+            return jsonify(ok=False, message="Internal Server Error"), 500
+        finally:
+            print("release worlds lock")
+            self.worlds_lock.release()
     
-    def _insert_file(self, file: FileStorage, treepath: str | None, worldid: str | None):
+    def _get_world_files_compression_info(self):
+        world_id = request.args.get("world")
+        
+        table_name = f"world_{world_id}"
+        if self._does_table_exist(table_name) is False:
+            return jsonify(ok=False, message="World not found"), 404
+        
+        conn, cursor = self._get_db()
+        cursor.execute(f"SELECT * FROM {table_name}")
+        
+        rows = cursor.fetchall()
+        compression_info_dict: dict[str, bool] = {}
+        
+        for row in rows:
+            hash = row[2]
+            compressed = row[3]
+            compression_info_dict[hash] = True if compressed else False
+        conn.close()
+        
+        return jsonify(ok=True, data=compression_info_dict, message="OK"), 200
+    
+    
+    def _insert_file(self, file: FileStorage, treepath: str | None, worldid: str | None, client_compressed: bool = False, client_is_compressed: bool = False, client_provided_hash: str | None = None):
         if worldid is None:
             return jsonify(ok=False, message="No world ID provided"), 400
         
@@ -601,30 +884,56 @@ class App:
         
         if self._does_table_exist(f"world_{worldid}") is False:
             return jsonify(ok=False, message="World not found"), 404
-        
-        table_name = f"world_{worldid}"
-        file_data: bytes = file.read()
-        print(f"Received: {len(file_data)} bytes from the client")
-        
-        file_hash = self._hash_bytes(file_data)
-        compressed_file_data = file_data
-        
-        conn, cursor = self._get_db()
-        cursor.execute(
-            f"INSERT OR REPLACE INTO {table_name} (path, hash) VALUES (?, ?)",
-            (treepath, file_hash)
-        )
-        
-        # Create directory (absolute)
-        objects_dir = os.path.join(self.base_dir, "objects", table_name)
-        os.makedirs(objects_dir, exist_ok=True)
-        
-        blob_path = os.path.join(objects_dir, f"blob_{file_hash}.bin")
-        with open(blob_path, "wb") as f:
-            f.write(compressed_file_data)
+        try:
+            print("wait for lock release (wait deferred tasks finished)")
+            self.worlds_lock.acquire()
+            table_name = f"world_{worldid}"
+            file_data: bytes = file.read()
+            print(f"Received: {len(file_data)} bytes from the client")
             
-        conn.commit()
-        conn.close()
+            file_hash = client_provided_hash
+            if client_provided_hash == None:
+                file_hash = self._hash_bytes(file_data)
+            
+            
+            # if client is compressing, trust client with compression data
+            
+            is_compressed = False
+            compressed_file_data = file_data
+            
+            if client_compressed is False:
+                print(f"old client -- does not support compression")
+                is_compressed, compressed_file_data = self._compress_file(file_data)
+            else:
+                print(f"new client -- supports compression")
+                is_compressed = client_is_compressed
+                compressed_file_data = file_data
+            
+            
+            
+            
+            conn, cursor = self._get_db()
+            cursor.execute(
+                f"INSERT OR REPLACE INTO {table_name} (path, hash, compressed) VALUES (?, ?, ?)",
+                (treepath, file_hash, is_compressed)
+            )
+            
+            # Create directory (absolute)
+            objects_dir = os.path.join(self.base_dir, "objects", table_name)
+            os.makedirs(objects_dir, exist_ok=True)
+            
+            blob_path = os.path.join(objects_dir, f"blob_{file_hash}.bin")
+            with open(blob_path, "wb") as f:
+                f.write(compressed_file_data)
+                
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"file insert failed: {e}")
+            raise RuntimeError(f"File Insert Failed: {e}")
+        finally:
+            print("release worlds lock")
+            self.worlds_lock.release()
     
     def _on_upload_data(self):
         if "file" not in request.files:
@@ -634,7 +943,11 @@ class App:
         treepath = request.form.get("path")
         worldid = request.form.get("world")
         
-        self._insert_file(file, treepath, worldid)
+        client_compressed = request.form.get("client_compressed") == "true"
+        client_is_compressed = request.form.get("client_is_compressed") == "true"
+        client_provided_hash = request.form.get("client_provided_hash")
+        
+        self._insert_file(file, treepath, worldid, client_compressed=client_compressed, client_is_compressed=client_is_compressed, client_provided_hash=client_provided_hash if client_provided_hash != "" else None)
 
             
         return jsonify(ok=True, message="Uploaded"), 200
@@ -642,13 +955,24 @@ class App:
     def _on_upload_data_batched(self):
         files = request.files.getlist("files")
         paths = request.form.getlist("paths")
+        client_hashes = request.form.getlist("client_hashes")
+        client_is_compressed = request.form.getlist("client_is_compressed")
+        client_compressed = request.form.get("client_compressed") == "true"
+        
         worldid = request.form.get("world")
 
         if not files or len(files) != len(paths):
             return jsonify(ok=False, message="Mismatched files and paths"), 400
         
-        for file, treepath in zip(files, paths):
-            self._insert_file(file, treepath, worldid)
+        client_hashes_list: list[str] | list[None] = client_hashes
+        
+        if not client_is_compressed:
+            client_is_compressed = ["false"] * len(files)
+            client_hashes_list = [None] * len(files)
+        
+        for file, treepath, is_compressed, client_hash in zip(files, paths, client_is_compressed, client_hashes_list):
+            print(f"upload tree path: {treepath}")
+            self._insert_file(file, treepath, worldid, client_compressed=client_compressed, client_is_compressed=is_compressed == "true", client_provided_hash=client_hash)
         
         return jsonify(ok=True, message="Uploaded"), 200
     
@@ -723,7 +1047,8 @@ class App:
             CREATE TABLE IF NOT EXISTS {table_name} (
                 id INTEGER PRIMARY KEY,
                 path STRING UNIQUE,
-                hash STRING
+                hash STRING,
+                compressed INTEGER DEFAULT 0
             )
             """
         )
