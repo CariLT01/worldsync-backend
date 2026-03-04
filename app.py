@@ -4,6 +4,7 @@ import sqlite3
 import hashlib
 import os
 import random
+import logging
 import jwt
 import sys
 import shutil
@@ -19,8 +20,27 @@ from datetime import datetime, timedelta
 from flask_cors import CORS
 from secret_key import SECRET_KEY
 import secrets
+import time
 import string
 
+logging.basicConfig(
+    level=logging.INFO,  # Minimum level to log
+    format='%(asctime)s UTC/GMT - %(name)s - %(levelname)s - %(message)s',
+)
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(levelname)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+file_handler = logging.FileHandler("app.log")
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('%(asctime)s UTC/GMT - %(name)s - %(levelname)s - %(message)s')
+file_formatter.converter = time.gmtime
+file_handler.setFormatter(file_formatter)
+
+logger = logging.getLogger(__name__)
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 def generate_slug(length=5):
     alphabet = string.ascii_letters + string.digits  # a-zA-Z0-9
@@ -77,8 +97,9 @@ class App:
         else:
             self.base_dir = os.path.abspath(os.path.dirname(__file__))
             
-        print(f"Templates directory: {os.path.join(self.base_dir, "templates")}")
-
+        logger.info(f"Templates directory: {os.path.join(self.base_dir, "templates")}")
+        logger.info("App started")
+        
         self.worlds_lock = threading.Lock()
 
         self.app = Flask(__name__, template_folder=os.path.join(self.base_dir, "templates"))
@@ -122,24 +143,24 @@ class App:
         return int(os.stat(file_path).st_mtime)
     
     def _run_deferred_startup_tasks_task(self):
-        print("Run deferred tasks...")
+        logger.info("Run deferred tasks...")
         try:
             self.worlds_lock.acquire()
             self._clean_database()
             self._migrate_per_file_compressions()
             self._detect_double_compression()
         except Exception as e:
-            print(f"deferred tasks failed: {e}")
+            logger.error(f"deferred tasks failed: {e}")
         finally:
-            print("deferred tasks worlds lock released")
+            logger.info("deferred tasks worlds lock released")
             self.worlds_lock.release()
-        print("Deferred tasks complete")
+        logger.info("Deferred tasks complete")
     
     def _run_deferred_tasks(self):
         
         thread = threading.Thread(target=self._run_deferred_startup_tasks_task, daemon=True, name="DeferredStartupTasks-Thread")
         thread.start()
-        print("Deferred tasks thread started")
+        logger.info("Deferred tasks thread started")
     
     def _enable_write_ahead_logging(self):
         conn = sqlite3.connect(os.path.join(self.base_dir, "database.db"))
@@ -150,7 +171,7 @@ class App:
     
     def _clean_database(self):
         
-        print("running clean db job")
+        logger.info("running clean db job")
         
         conn, cursor = self._get_db()
         
@@ -170,10 +191,10 @@ class App:
                 
                 if not table_exists:
                     try:
-                        print(f"[ DELETE WORLD ] delete {table_name}. reason: table does not exist")
+                        logger.info(f"[ DELETE WORLD ] delete {table_name}. reason: table does not exist")
                         cursor.execute("DELETE FROM worlds WHERE id = ?", (id,))
                     except Exception as e:
-                        print(f"delete world failed: {e}")
+                        logger.error(f"delete world failed: {e}")
                     continue
                 
                 # check if folder exists
@@ -183,14 +204,14 @@ class App:
                 
                 if not folder_exists:
                     try:
-                        print(f"[ DELETE WORLD ] delete {table_name}. reason: folder does not exist")
+                        logger.info(f"[ DELETE WORLD ] delete {table_name}. reason: folder does not exist")
                         # delete row
                         cursor.execute("DELETE FROM worlds WHERE id = ?", (id,))
                         # drop table if it exists
-                        print(f"[ DROP TABLE ] drop {table_name}, reason: folder does not exist")
+                        logger.info(f"[ DROP TABLE ] drop {table_name}, reason: folder does not exist")
                         cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
                     except Exception as e:
-                        print(f"delete world failed: {e}")
+                        logger.error(f"delete world failed: {e}")
                     continue
                 
                 # check if folder is empty
@@ -198,14 +219,14 @@ class App:
                 folder_contents = os.listdir(folder_path)
                 if len(folder_contents) == 0:
                     try:
-                        print(f"[ DELETE WORLD ] delete {table_name}. reason: folder is empty")
+                        logger.info(f"[ DELETE WORLD ] delete {table_name}. reason: folder is empty")
                         # delete row
                         cursor.execute("DELETE FROM worlds WHERE id = ?", (id,))
                         # drop table if it exists
-                        print(f"[ DROP TABLE ] drop {table_name}, reason: folder is empty")
+                        logger.info(f"[ DROP TABLE ] drop {table_name}, reason: folder is empty")
                         cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
                     except Exception as e:
-                        print(f"delete world failed: {e}")
+                        logger.error(f"delete world failed: {e}")
                     continue
             
             for row in rows:
@@ -229,9 +250,9 @@ class App:
                         # delete row
                         try:
                             cursor.execute(f"DELETE FROM {table_name} WHERE id = ?", (id,))
-                            print(f"[ DELETE ROW ] delete in {table_name} row {path} because it doesn't exist")
+                            logger.info(f"[ DELETE ROW ] delete in {table_name} row {path} because it doesn't exist")
                         except Exception as e:
-                            print(f"failed to delete row: {e}")
+                            logger.error(f"failed to delete row: {e}")
                         continue
                 
                 # do the opposite, loop through all files, check if it exists in the table, and delete file if it doesn't
@@ -243,10 +264,10 @@ class App:
                             hash = file[5:-4]
                             cursor.execute(f"SELECT * FROM {table_name} WHERE hash = ?", (hash,))
                             if cursor.fetchone() is None:
-                                print(f"[ DELETE FILE ] delete in {table_name} filehash {hash} because it doesn't exist in table")
+                                logger.info(f"[ DELETE FILE ] delete in {table_name} filehash {hash} because it doesn't exist in table")
                                 os.remove(os.path.join(self.base_dir, "objects", table_name, file))
                         except Exception as e:
-                            print(f"failed to delete file: {e}")
+                            logger.error(f"failed to delete file: {e}")
                             
                 
             for world in os.listdir(os.path.join(self.base_dir, "objects")):
@@ -257,36 +278,36 @@ class App:
                 
                 if not self._does_table_exist(world):
                     # delete row
-                    # print(f"[ DELETE WORLD ] delete {world}. reason: table does not exist")
+                    # logger.info(f"[ DELETE WORLD ] delete {world}. reason: table does not exist")
                     # cursor.execute(f"DROP TABLE IF EXISTS {world}")
                     # delete from worlds if it exists
                     
                     try:
                         shutil.rmtree(os.path.join(self.base_dir, "objects", world))
                     except Exception as e:
-                        print("unused folder delete failed")
-                        print(e)
+                        logger.error("unused folder delete failed")
+                        logger.error(e)
                     
-                    print(f"DROP TABLE IF EXISTS: {world} reason: table does not exist")
+                    logger.info(f"DROP TABLE IF EXISTS: {world} reason: table does not exist")
                     try:
                         cursor.execute("DELETE FROM worlds WHERE id = ?", (int(world[6:]),))
                     except Exception as e:
-                        print(f"cannot delete from row: {e}")
+                        logger.error(f"cannot delete from row: {e}")
                     continue
         except Exception as e:
-            print(f"cleanup job failed: {e}")
+            logger.error(f"cleanup job failed: {e}")
         conn.commit()
         conn.close()
-        print("clean db job complete")
-        print("running vacumn job")
+        logger.info("clean db job complete")
+        logger.info("running vacumn job")
         try:
             conn, cursor = self._get_db()
             cursor.execute("VACUUM")
             conn.commit()
             conn.close()
         except Exception as e:
-            print(f"vacumn job failed: {e}")
-        print("vacumn job complete")
+            logger.error(f"vacumn job failed: {e}")
+        logger.info("vacumn job complete")
     
     def _get_free_space(self):
         _total, _used, free = shutil.disk_usage(self.base_dir)
@@ -330,7 +351,7 @@ class App:
             conn.commit()
             conn.close()
         except Exception as e:
-            print(f"database migration failed: {e}")
+            logger.error(f"database migration failed: {e}")
     def _load_double_compression_cache(self) -> dict[str, int] | None:
         cache_file_path = os.path.join(self.base_dir, "cache", "double_compression_cache.json")
         if os.path.exists(cache_file_path) is False:
@@ -349,7 +370,7 @@ class App:
         cursor.execute("SELECT * FROM worlds")
         rows = cursor.fetchall()
         
-        print("Run double-compression detection")
+        logger.info("Run double-compression detection")
         
         double_compression_cache = self._load_double_compression_cache() or {}
         new_compression_cache: dict[str, int] = {}
@@ -374,7 +395,7 @@ class App:
                     if double_compression_cache.get(file_path) is not None:
                         cached_last_modified_time = double_compression_cache[file_path]
                         if current_last_modified_time == cached_last_modified_time:
-                            print(f"Skipped double-compression check: {file_path}")
+                            logger.info(f"Skipped double-compression check: {file_path}")
                             continue
                     
                     
@@ -394,11 +415,11 @@ class App:
                     try:
                         _ = lzma.decompress(decompressed_once)
                     except lzma.LZMAError:
-                        print(f"double-compression not detected for {file_path}")
+                        logger.info(f"double-compression not detected for {file_path}")
                         continue  # only single compression, skip
                     else:
                         # Double compression detected, fix by keeping only one layer
-                        print(f"[FIX] Double compression detected for {file_path}")
+                        logger.info(f"[FIX] Double compression detected for {file_path}")
                         # recompress once if you want to keep compressed storage
                         fixed_data = decompressed_once
                         with open(file_path, "wb") as f:
@@ -412,7 +433,7 @@ class App:
 
                 
             except Exception as e:
-                print(f"cannot add column: {e}")
+                logger.error(f"cannot add column: {e}")
                 continue
         conn.close()
         
@@ -449,7 +470,7 @@ class App:
                     # compress
                     isCompressed, processedData = self._compress_file(file_data)
                     
-                    print(f"process: {file_path} compressed: {isCompressed}")
+                    logger.info(f"process: {file_path} compressed: {isCompressed}")
                     
                     # write
                     with open(file_path, "wb") as f:
@@ -459,7 +480,7 @@ class App:
 
                 
             except Exception as e:
-                print(f"cannot add column: {e}")
+                logger.error(f"cannot add column: {e}")
                 continue
         conn.close()
     
@@ -482,10 +503,10 @@ class App:
 
         if row:
             url = row[0]  # url is the first (and only) column selected
-            print(f"URL for slug {slug_to_find}: {url}")
+            logger.info(f"URL for slug {slug_to_find}: {url}")
             return jsonify(ok=True, message="URL found", url=url), 200
         else:
-            print(f"No URL found for slug {slug_to_find}")
+            logger.info(f"No URL found for slug {slug_to_find}")
             return jsonify(ok=False, message="No URL found"), 404
             
         conn.close()
@@ -578,6 +599,7 @@ class App:
             # Recursively delete folder
             shutil.rmtree(world_path)
         except Exception as e:
+            logger.error("Deleting world failed: %s" % e)
             return jsonify(ok=False, message=f"Error deleting world: {e}"), 500
 
         return jsonify(ok=True, message="World deleted"), 200
@@ -666,7 +688,7 @@ class App:
                         "size": total_size
                     })
                 except Exception as e:
-                    print(f"Failed to query details for: {id}")
+                    logger.error(f"Failed to query details for: {id}")
                     
                     returnedData.append({
                         "id": id,
@@ -676,7 +698,7 @@ class App:
             
             return jsonify(ok=True, data=returnedData), 200
         except Exception as e:
-            print(f"Error occurred: {e}")
+            logger.error(f"Error occurred: {e}")
             return jsonify(ok=False, message="Internal Server Error"), 500
            
     def _verify_credentials(self, username: str, password: str):
@@ -687,13 +709,13 @@ class App:
             ph.verify(ADMIN_USERNAME, username)
             isUsernameCorrect = True
         except argon2.exceptions.VerifyMismatchError:
-            print(f"Invalid credentials detected")
+            logger.warning("Invalid credentials detected")
             pass
         try:
             ph.verify(ADMIN_HASHED_PASSWORD, password)
             isPasswordCorrect = True
         except argon2.exceptions.VerifyMismatchError:
-            print(f"Invalid credentials detected")
+            logger.warning("Invalid credentials detected")
             pass
         
         if isUsernameCorrect == False or isPasswordCorrect == False:
@@ -714,6 +736,7 @@ class App:
             return jsonify(ok=False, message="Missing username or password"), 400
         
         if not self._verify_credentials(username, password):
+            logger.warning("Invalid credentials detected")
             return jsonify(ok=False, message="Invalid credentials"), 401
 
         
@@ -778,10 +801,10 @@ class App:
         
         if compressionRatio >= 1:
             # not worth to compress
-            print(f"Compression ratio: {compressionRatio} -- compression reversed")
+            logger.info(f"Compression ratio: {compressionRatio} -- compression reversed")
             return (False, fileData)
         else:
-            print(f"Compression ratio: {compressionRatio} -- compression applied")
+            logger.info(f"Compression ratio: {compressionRatio} -- compression applied")
             return (True, compressedData)
     
     def _decompress_file(self, fileData: bytes):
@@ -804,7 +827,7 @@ class App:
         if self._does_table_exist(table_name) is False:
             return jsonify(ok=False, message="World not found"), 404
         try:
-            print("wait for lock release (wait deferred tasks finished)")
+            logger.info("wait for lock release (wait deferred tasks finished)")
             self.worlds_lock.acquire()
             # Find it in the database
             conn, cursor = self._get_db()
@@ -817,6 +840,7 @@ class App:
                     conn.close()
                     return jsonify(ok=False, message="File not found")
             except Exception as e:
+                logger.error("Download failed: %s" % e)
                 raise Exception(e)
             finally:
                 conn.close()
@@ -829,14 +853,14 @@ class App:
             isCompressed = row[3]
             decompressed_data = compressed_data
             if client_supports_compression is False:
-                print(f"old client -- compression unsupported")
+                logger.info(f"old client -- compression unsupported")
                 if isCompressed == 1:
-                    print(f"decompress")
+                    logger.info(f"decompress")
                     decompressed_data = self._decompress_file(compressed_data)
                 else:
-                    print(f"don't decompress: isCompressed = {isCompressed}")
+                    logger.info(f"don't decompress: isCompressed = {isCompressed}")
             else:
-                print(f"new client -- compression supported")
+                logger.info(f"new client -- compression supported")
 
             # Wrap in BytesIO so Flask can send it as a file
             file_stream = io.BytesIO(decompressed_data)
@@ -851,10 +875,10 @@ class App:
                 mimetype="application/octet-stream"
             )
         except Exception as e:
-            print(f"failed to send download: {e}")
+            logger.error(f"failed to send download: {e}")
             return jsonify(ok=False, message="Internal Server Error"), 500
         finally:
-            print("release worlds lock")
+            logger.info("release worlds lock")
             self.worlds_lock.release()
     
     def _get_world_files_compression_info(self):
@@ -892,11 +916,11 @@ class App:
         if self._does_table_exist(f"world_{worldid}") is False:
             return jsonify(ok=False, message="World not found"), 404
         try:
-            print("wait for lock release (wait deferred tasks finished)")
+            logger.info("wait for lock release (wait deferred tasks finished)")
             self.worlds_lock.acquire()
             table_name = f"world_{worldid}"
             file_data: bytes = file.read()
-            print(f"Received: {len(file_data)} bytes from the client")
+            logger.info(f"Received: {len(file_data)} bytes from the client")
             
             file_hash = client_provided_hash
             if client_provided_hash == None:
@@ -909,10 +933,10 @@ class App:
             compressed_file_data = file_data
             
             if client_compressed is False:
-                print(f"old client -- does not support compression")
+                logger.info(f"old client -- does not support compression")
                 is_compressed, compressed_file_data = self._compress_file(file_data)
             else:
-                print(f"new client -- supports compression")
+                logger.info(f"new client -- supports compression")
                 is_compressed = client_is_compressed
                 compressed_file_data = file_data
             
@@ -936,10 +960,10 @@ class App:
             conn.commit()
             conn.close()
         except Exception as e:
-            print(f"file insert failed: {e}")
+            logger.error(f"file insert failed: {e}")
             raise RuntimeError(f"File Insert Failed: {e}")
         finally:
-            print("release worlds lock")
+            logger.info("release worlds lock")
             self.worlds_lock.release()
     
     def _on_upload_data(self):
@@ -978,7 +1002,7 @@ class App:
             client_hashes_list = [None] * len(files)
         
         for file, treepath, is_compressed, client_hash in zip(files, paths, client_is_compressed, client_hashes_list):
-            print(f"upload tree path: {treepath}")
+            logger.info(f"upload tree path: {treepath}")
             self._insert_file(file, treepath, worldid, client_compressed=client_compressed, client_is_compressed=is_compressed == "true", client_provided_hash=client_hash)
         
         return jsonify(ok=True, message="Uploaded"), 200
@@ -1001,9 +1025,9 @@ class App:
             if os.path.exists(blob_path):
                 os.remove(blob_path)
             else:
-                print(f"Warn: file not found: {blob_path}")
+                logger.info(f"Warn: file not found: {blob_path}")
         else:
-            print(f"dbg: Another entry still using this blob")
+            logger.info(f"dbg: Another entry still using this blob")
         
         conn.commit()
         conn.close()
@@ -1041,7 +1065,7 @@ class App:
         return jsonify(ok=True, message="File deleted"), 200
         
     def _create_world_storage(self):
-        print(f"Creating new world storage entry in DB")
+        logger.info(f"Creating new world storage entry in DB")
         
         conn, cursor = self._get_db()
         cursor.execute("INSERT INTO worlds (id) VALUES (?)", (random.randint(1000000, 9999999),))
@@ -1063,7 +1087,7 @@ class App:
         conn.commit()
         conn.close()
         
-        print(f"Entry successfully created")
+        logger.info(f"Entry successfully created")
         return new_world_id
     
     def _on_create_world(self):
