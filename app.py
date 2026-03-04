@@ -811,6 +811,7 @@ class App:
             cursor.execute(f"SELECT * FROM {table_name} WHERE hash = ?", (hash,))
             row = cursor.fetchone()
             if row == None:
+                self.worlds_lock.release()
                 return jsonify(ok=False, message="File not found")
             
             conn.close()
