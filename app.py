@@ -106,8 +106,10 @@ class App:
         # Base directory: PythonAnywhere path for linux, else the module directory
         if sys.platform.startswith("linux"):
             self.base_dir = "/home/mcworldsyncutils/mysite"
+            self.is_prod = True
         else:
             self.base_dir = os.path.abspath(os.path.dirname(__file__))
+            self.is_prod = False
 
         logger.info("Templates directory: %s" % os.path.join(self.base_dir, "templates"))
         logger.info("App started")
@@ -124,7 +126,9 @@ class App:
         self._initialize_database()
         self._enable_write_ahead_logging()
         self._migrate_database()
-        self._run_deferred_tasks()
+        # self._run_deferred_tasks()
+    
+        # self.app.before()
 
         self.app.add_url_rule(
             "/upload", view_func=self._on_upload_data, methods=["POST"]
@@ -176,16 +180,22 @@ class App:
             view_func=self._get_world_files_compression_info,
             methods=["GET"],
         )
-        self.app.add_url_rule("/manage", view_func=self._manage, methods=["GET"])
+        if not self.is_prod:
+            self.app.add_url_rule("/manage", view_func=self._manage, methods=["GET"])
+            
+            self.app.add_url_rule(
+                "/assets/<path:filename>", view_func=self._serve_assets, methods=["GET"]
+            )
+            self.app.add_url_rule("/r", view_func=self._redirect)
+        
         self.app.add_url_rule("/", view_func=self._landing, methods=["GET"])
         self.app.add_url_rule(
             "/api/revoke_token", view_func=self._revoke_token, methods=["GET"]
         )
-        self.app.add_url_rule("/r", view_func=self._redirect)
+        
 
-        self.app.add_url_rule(
-            "/assets/<path:filename>", view_func=self._serve_assets, methods=["GET"]
-        )
+
+
 
         logger.info("Main thread ready to serve requests")
 
@@ -193,7 +203,7 @@ class App:
     def _get_last_modified_time_file_unix(file_path: str):
         return int(os.stat(file_path).st_mtime)
 
-    def _run_deferred_startup_tasks_task(self):
+    def run_deferred_startup_tasks_task(self):
         logger.info("Run deferred tasks...")
         try:
             self.worlds_lock.acquire()
@@ -210,7 +220,7 @@ class App:
     def _run_deferred_tasks(self):
 
         thread = threading.Thread(
-            target=self._run_deferred_startup_tasks_task,
+            target=self.run_deferred_startup_tasks_task,
             daemon=True,
             name="DeferredStartupTasks-Thread",
         )
