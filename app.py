@@ -143,7 +143,8 @@ class App:
     
     def _enable_write_ahead_logging(self):
         conn = sqlite3.connect(os.path.join(self.base_dir, "database.db"))
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA journal_mode=TRUNCATE")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.commit()
         conn.close()
     
@@ -807,14 +808,19 @@ class App:
             self.worlds_lock.acquire()
             # Find it in the database
             conn, cursor = self._get_db()
-            # get row
-            cursor.execute(f"SELECT * FROM {table_name} WHERE hash = ?", (hash,))
-            row = cursor.fetchone()
-            if row == None:
-                self.worlds_lock.release()
-                return jsonify(ok=False, message="File not found")
+            try:
+                # get row
+                cursor.execute(f"SELECT * FROM {table_name} WHERE hash = ?", (hash,))
+                row = cursor.fetchone()
+                if row == None:
+                    self.worlds_lock.release()
+                    conn.close()
+                    return jsonify(ok=False, message="File not found")
+            except Exception as e:
+                raise Exception(e)
+            finally:
+                conn.close()
             
-            conn.close()
             
             # Read compressed data
             with open(path, "rb") as f:
