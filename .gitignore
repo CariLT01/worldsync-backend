@@ -6,3 +6,11 @@ secret_key.py
 cache/
 app.log
 /app.log
+
+# cache
+.ruff_cache/
+.venv/
+__pycache__/
+__pycache__
+./__pycache__
+/__pycache__
