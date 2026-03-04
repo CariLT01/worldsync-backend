@@ -4,3 +4,4 @@ database.db
 ./database.db
 secret_key.py
 cache/
+app.log
