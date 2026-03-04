@@ -5,3 +5,4 @@ database.db
 secret_key.py
 cache/
 app.log
+/app.log
