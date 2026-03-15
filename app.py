@@ -63,11 +63,13 @@ ph = argon2.PasswordHasher()
 
 
 class WorldDataStatisticsItem(TypedDict):
-
     id: str
     lastModifiedTime: str
     size: int
 
+class LinkItem(TypedDict):
+    slug: str
+    url: str
 
 def human_readable_time(dt: datetime) -> str:
     """
@@ -151,6 +153,9 @@ class App:
         self.app.add_url_rule(
             "/delete_world", view_func=self._on_delete_world, methods=["DELETE"]
         )
+        self.app.add_url_rule(
+            "/delete_link", view_func=self._on_delete_link, methods=["DELETE"]
+        )
 
         self.app.add_url_rule(
             "/exists", view_func=self._on_does_world_exist, methods=["GET"]
@@ -161,6 +166,10 @@ class App:
         self.app.add_url_rule(
             "/api/worlds", view_func=self._query_worlds, methods=["GET"]
         )
+        self.app.add_url_rule(
+            "/api/links", view_func=self._query_links, methods=["GET"]
+        )
+        
         self.app.add_url_rule("/api/login", view_func=self._login, methods=["POST"])
         self.app.add_url_rule(
             "/api/create_redirect_url",
@@ -674,6 +683,31 @@ class App:
 
         return jsonify(ok=True, message="Token revoked"), 200
 
+    def _on_delete_link(self):
+        slug = request.args.get("slug")
+        token = request.args.get("token")
+        if not token:
+            return jsonify(ok=False, message="No token provided"), 400
+        if not slug:
+            return jsonify(ok=False, message="No slug provided"), 400
+        if not self._is_token_valid(token):
+            return jsonify(ok=False, message="Invalid token"), 401
+        
+        try:
+            conn, cursor = self._get_db()
+            cursor.execute("DELETE FROM shortened_urls WHERE slug = ?", (slug,))
+            conn.commit()
+            cursor.close()
+        except Exception as e:
+            logger.error(f"Failed to delete shortened slug: {e}")
+            return jsonify(ok=False, message="Internal server error"), 500
+        else:
+            logger.info("Successfully deleted shortened URL")
+            return jsonify(ok=True, message="OK"), 200
+            
+        
+            
+
     def _on_delete_world(self):
         world = request.args.get("world")
         if not world:
@@ -760,6 +794,38 @@ class App:
         latest_mtime = max(child.stat().st_mtime for child in folder.iterdir())
 
         return datetime.fromtimestamp(latest_mtime)
+
+    def _query_links(self):
+        
+        token = request.args.get("token")
+        if token == None:
+            return jsonify(ok=False, message="No token provided"), 400
+        if not self._is_token_valid(token):
+            return jsonify(ok=False, message="Invalid token"), 401
+        
+        conn, cursor = self._get_db()
+        cursor.execute("SELECT * FROM shortened_urls")
+        result = cursor.fetchall()
+        conn.close()
+        
+        returnedData: list[LinkItem] = []
+        
+        for row in result:
+            _id = row[0]
+            slug = row[1]
+            url = row[2]
+            
+            item: LinkItem = {
+                "slug": slug,
+                "url": url
+            }
+            
+            returnedData.append(item)
+        
+        return jsonify(ok=True, message="OK", data=returnedData)
+
+            
+            
 
     def _query_worlds(self):
         try:
