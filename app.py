@@ -5,6 +5,7 @@ from flask import (
     send_file,
     send_from_directory,
     render_template,
+    make_response
 )
 from werkzeug.datastructures import FileStorage
 import sqlite3
@@ -19,6 +20,7 @@ import json
 import lzma
 import io
 import argon2
+import base64
 import threading
 from typing import TypedDict
 from pathlib import Path
@@ -28,6 +30,10 @@ from secret_key import SECRET_KEY
 import secrets
 import time
 import string
+from pydantic import BaseModel, ValidationError
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+from TokenAudiencesEnum import TokenAudience
 
 logging.basicConfig(
     level=logging.INFO,  # Minimum level to log
@@ -121,13 +127,19 @@ class App:
         self.app = Flask(
             __name__, template_folder=os.path.join(self.base_dir, "templates")
         )
-        CORS(self.app)
+        CORS(self.app, supports_credentials=True,    origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ] )
 
         self.revoked_tokens: set[int] = set()
 
         self._initialize_database()
         self._enable_write_ahead_logging()
         self._migrate_database()
+        self._generate_keypair()
         # self._run_deferred_tasks()
     
         # self.app.before()
@@ -189,6 +201,11 @@ class App:
             view_func=self._get_world_files_compression_info,
             methods=["GET"],
         )
+        
+        self.app.add_url_rule(
+            "/api/v1/auth/keys", view_func=self._get_keys_endpoint, methods=["GET"]
+        )
+        
         if not self.is_prod:
             self.app.add_url_rule("/manage", view_func=self._manage, methods=["GET"])
             
@@ -202,11 +219,20 @@ class App:
             "/api/revoke_token", view_func=self._revoke_token, methods=["GET"]
         )
         
+        self.app.add_url_rule("/api/v1/auth/refresh", view_func=self._refresh_token, methods=["POST"])
 
 
 
 
         logger.info("Main thread ready to serve requests")
+
+    def _generate_keypair(self):
+        print(f"New keypair generated")
+        self.private_key = Ed25519PrivateKey.generate()
+        self.public_key = self.private_key.public_key()
+        
+        public_key_bytes = self.public_key.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+        self.public_key_b64 = base64.b64encode(public_key_bytes).decode()
 
     @staticmethod
     def _get_last_modified_time_file_unix(file_path: str):
@@ -614,6 +640,9 @@ class App:
             if not cursor.fetchone():
                 return slug
 
+    def _get_keys_endpoint(self):
+        return jsonify(ok=True, message="OK", data={"jwtPublicKey": self.public_key_b64})
+
     def _find_redirect_url(self):
         slug_to_find = request.args.get("slug")
 
@@ -664,16 +693,20 @@ class App:
         return jsonify(ok=True, message="URL created", url=f"/r?q={slug}&v2=true"), 200
 
     def _revoke_token(self):
-
-        token = request.args.get("token")
-
-        if not token:
-            return jsonify(ok=False, message="No token provided"), 400
-
-        if not self._is_token_valid(token):
+        if not self._check_request_valid():
             return jsonify(ok=False, message="Invalid token"), 401
 
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        refresh_token = request.cookies.get("auth")
+        
+        if refresh_token == None:
+            return jsonify(ok=False, message="No refresh token provided"), 401
+        
+        if not self._is_refresh_valid(refresh_token):
+            return jsonify(ok=False, message="Refresh token is not valid"), 401
+            
+
+
+        payload = jwt.decode(refresh_token, self.public_key, algorithms=["EdDSA"], audience=TokenAudience.DASHBOARD_REFRESH)
         id = payload.get("id")
 
         if id == None:
@@ -685,12 +718,10 @@ class App:
 
     def _on_delete_link(self):
         slug = request.args.get("slug")
-        token = request.args.get("token")
-        if not token:
-            return jsonify(ok=False, message="No token provided"), 400
+        
         if not slug:
             return jsonify(ok=False, message="No slug provided"), 400
-        if not self._is_token_valid(token):
+        if not self._check_request_valid():
             return jsonify(ok=False, message="Invalid token"), 401
         
         try:
@@ -706,18 +737,27 @@ class App:
             return jsonify(ok=True, message="OK"), 200
             
         
+    def _get_auth(self) -> str:
+        try:
+            authorizationHeader = request.headers.get("Authorization")
+            if authorizationHeader == None: return ""
+            cleanHeader = authorizationHeader.removeprefix("Bearer ")
             
+            return cleanHeader
+        except Exception as e:
+            print(f"fetch auth header failed: {e}")
+            return ""
+    
+    def _check_request_valid(self) -> bool:
+        return self._is_access_valid(self._get_auth())
+        
 
     def _on_delete_world(self):
         world = request.args.get("world")
         if not world:
             return jsonify(ok=False, message="No world ID provided"), 400
 
-        token = request.args.get("token")
-        if not token:
-            return jsonify(ok=False, message="No token provided"), 400
-
-        if not self._is_token_valid(token):
+        if not self._check_request_valid():
             return jsonify(ok=False, message="Invalid token"), 401
 
         # Sanitize the world ID: allow only digits
@@ -750,23 +790,60 @@ class App:
 
         return jsonify(ok=True, message="World deleted"), 200
 
-    def _issue_jwt(self):
-
+    def _issue_jwt_access(self):
+        
         payload = {
-            "id": random.randint(1000000, 9999999),
+            "id": random.randint(0, 9999999),
             "exp": datetime.utcnow() + timedelta(minutes=1),
             "iat": datetime.utcnow(),
+            "aud": TokenAudience.DASHBOARD_ACCESS
+        }
+        
+        token = jwt.encode(payload, self.private_key, algorithm="EdDSA")
+        
+        return token
+
+    def _issue_jwt_refresh(self):
+
+        payload = {
+            "id": random.randint(0, 9999999),
+            "exp": datetime.utcnow() + timedelta(hours=1),
+            "iat": datetime.utcnow(),
+            "aud": TokenAudience.DASHBOARD_REFRESH
         }
 
-        token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+        token = jwt.encode(payload, self.private_key, algorithm="EdDSA")
 
         return token
 
-    def _is_token_valid(self, token: str):
+    def _is_access_valid(self, token: str):
         try:
-            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            print(f"token: {token}")
+            payload = jwt.decode(token, self.public_key, algorithms=["EdDSA"], audience=TokenAudience.DASHBOARD_ACCESS)
             id = payload.get("id")
             if id == None:
+                return False
+            aud = payload.get("aud")
+            if aud != TokenAudience.DASHBOARD_ACCESS:
+                print(f"bad audience: {aud}")
+                return False
+            return True
+        except jwt.ExpiredSignatureError:
+            print(f"expired signature")
+            return False
+        except jwt.InvalidTokenError:
+            print(f"invalid token")
+            return False
+    
+    def _is_refresh_valid(self, token: str):
+        try:
+            payload = jwt.decode(token, self.public_key, algorithms=["EdDSA"], audience=TokenAudience.DASHBOARD_REFRESH)
+            id = payload.get("id")
+            if id == None:
+                return False
+            aud = payload.get("aud")
+            if aud != TokenAudience.DASHBOARD_REFRESH:
+                print(f"bad audience: {aud}")
                 return False
             if id in self.revoked_tokens:
                 return False
@@ -797,10 +874,8 @@ class App:
 
     def _query_links(self):
         
-        token = request.args.get("token")
-        if token == None:
-            return jsonify(ok=False, message="No token provided"), 400
-        if not self._is_token_valid(token):
+        
+        if not self._check_request_valid():
             return jsonify(ok=False, message="Invalid token"), 401
         
         conn, cursor = self._get_db()
@@ -830,11 +905,9 @@ class App:
     def _query_worlds(self):
         try:
 
-            token = request.args.get("token")
-            if token == None:
-                return jsonify(ok=False, message="No token provided"), 400
+        
 
-            if not self._is_token_valid(token):
+            if not self._check_request_valid():
                 return jsonify(ok=False, message="Invalid token"), 401
 
             conn, cursor = self._get_db()
@@ -896,6 +969,21 @@ class App:
             return False
         return True
 
+    def _refresh_token(self):
+        refresh_token = request.cookies.get("auth")
+        
+        if refresh_token == None or refresh_token == "":
+            return jsonify(ok=False, message="No refresh token provided"), 401
+        
+        if not self._is_refresh_valid(refresh_token):
+            return jsonify(ok=False, message="Refresh token is invalid"), 401
+        
+        access_token = self._issue_jwt_access()
+        
+        return jsonify(ok=True, message="OK", data={
+            "accessToken": access_token
+        }), 200
+
     def _login(self):
 
         data: dict = request.get_json()
@@ -913,9 +1001,13 @@ class App:
             logger.warning("Invalid credentials detected")
             return jsonify(ok=False, message="Invalid credentials"), 401
 
-        token = self._issue_jwt()
-
-        return jsonify(ok=True, message="Login successful", data=token), 200
+        token = self._issue_jwt_refresh()
+        
+        response = jsonify(ok=True, message="Login successful OK")
+        response.set_cookie("auth", token, httponly=True, secure=self.is_prod, samesite="Lax")
+        
+        
+        return response
 
     def _does_table_exist(self, name: str) -> bool:
         conn, cursor = self._get_db()
@@ -1298,3 +1390,6 @@ class App:
             return jsonify(ok=False, message="World not found"), 404
 
         return jsonify(ok=True, message="World found"), 200
+
+    def run(self):
+        self.app.run()
