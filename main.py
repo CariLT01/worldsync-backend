@@ -6,4 +6,4 @@ app = app_.app
 
 if sys.argv[1] == "debug":
     print("IS DEBUG")
-    app.run()
+    app.run(debug=True)

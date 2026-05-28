@@ -24,7 +24,7 @@ import base64
 import threading
 from typing import TypedDict
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, UTC
 from flask_cors import CORS
 from secret_key import SECRET_KEY
 import secrets
@@ -33,7 +33,20 @@ import string
 from pydantic import BaseModel, ValidationError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
+from pydantic import BaseModel, ValidationError
 from TokenAudiencesEnum import TokenAudience
+from token_bucket import TokenBucket
+
+class CreateRedirectURLValidate(BaseModel):
+    
+    target: str
+    require_access_token: bool
+
+class CreateAccessTokenValidate(BaseModel):
+    target_slug: str
+    expiry_days: int
+    label: str
+    maximum_uses: int
 
 logging.basicConfig(
     level=logging.INFO,  # Minimum level to log
@@ -76,6 +89,14 @@ class WorldDataStatisticsItem(TypedDict):
 class LinkItem(TypedDict):
     slug: str
     url: str
+    requires_access_token: bool
+    
+class AccessTokenItem(TypedDict):
+    slug: str
+    label: str
+    expiry_time: int
+    uses: int
+    maximum_uses: int
 
 def human_readable_time(dt: datetime) -> str:
     """
@@ -132,6 +153,8 @@ class App:
         "http://127.0.0.1:5173",
         "http://localhost:4173",
         "http://127.0.0.1:4173",
+        "http://127.0.0.1:5174",
+        "http://localhost:5174"
     ] )
 
         self.revoked_tokens: set[int] = set()
@@ -139,7 +162,11 @@ class App:
         self._initialize_database()
         self._enable_write_ahead_logging()
         self._migrate_database()
+        self._migrate_redirect_database()
+        self._migrate_access_tokens_database()
         self._generate_keypair()
+        
+        self.used_salts: set[str] = set()
         # self._run_deferred_tasks()
     
         # self.app.before()
@@ -181,6 +208,13 @@ class App:
         self.app.add_url_rule(
             "/api/links", view_func=self._query_links, methods=["GET"]
         )
+        self.app.add_url_rule(
+            "/api/access_tokens", view_func=self._query_access_tokens, methods=["GET"]
+        )
+        
+        self.app.add_url_rule(
+            "/api/generate_challenge", view_func=self._get_redirect_pow, methods=["GET"] 
+        )
         
         self.app.add_url_rule("/api/login", view_func=self._login, methods=["POST"])
         self.app.add_url_rule(
@@ -188,6 +222,12 @@ class App:
             view_func=self._create_redirect_url,
             methods=["POST"],
         )
+        self.app.add_url_rule(
+            "/api/create_access_token",
+            view_func=self._create_access_token_url,
+            methods=["POST"]
+        )
+        
         self.app.add_url_rule(
             "/api/get_redirect_location",
             view_func=self._find_redirect_url,
@@ -222,9 +262,18 @@ class App:
         self.app.add_url_rule("/api/v1/auth/refresh", view_func=self._refresh_token, methods=["POST"])
 
 
+        self.challenge_rates: dict[str, TokenBucket] = {}
+
 
 
         logger.info("Main thread ready to serve requests")
+
+    def _get_client_ip(self):
+        if "X-Forwarded-For" in request.headers:
+            # first IP is the original client
+            return request.headers["X-Forwarded-For"].split(",")[0].strip()
+
+        return request.remote_addr
 
     def _generate_keypair(self):
         print(f"New keypair generated")
@@ -477,8 +526,31 @@ class App:
         cursor.execute(
             "CREATE TABLE IF NOT EXISTS shortened_urls (id INTEGER PRIMARY KEY, slug TEXT, url TEXT)"
         )
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS access_tokens (id INTEGER PRIMARY KEY, token TEXT, slug TEXT, label TEXT)"
+        )
         conn.commit()
         conn.close()
+
+    def _migrate_redirect_database(self):
+        try:
+            conn, cursor = self._get_db()
+            cursor.execute("ALTER TABLE shortened_urls ADD COLUMN requireAccessToken BOOLEAN DEFAULT false")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"database migration for shortened urls failed: {e}")
+
+    def _migrate_access_tokens_database(self):
+        try:
+            conn, cursor = self._get_db()
+            cursor.execute("ALTER TABLE access_tokens ADD COLUMN expiryTime INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE access_tokens ADD COLUMN maximumUses INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE access_tokens ADD COLUMN uses INTEGER DEFAULT 0")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"database migration for access tokens failed: {e}")
 
     def _migrate_database(self):
         try:
@@ -643,54 +715,207 @@ class App:
     def _get_keys_endpoint(self):
         return jsonify(ok=True, message="OK", data={"jwtPublicKey": self.public_key_b64})
 
+    def _generate_pow_token(self) -> str:
+        payload = {
+            "salt": secrets.token_hex(16),
+            "aud": TokenAudience.REDIRECT_POW,
+            "diff": 18,
+            "exp": datetime.now(UTC) + timedelta(minutes=5)
+        }
+        
+        token = jwt.encode(payload, key=SECRET_KEY, algorithm="HS256")
+        
+        return token
+
+    
+
+    def _get_redirect_pow(self):
+        try:
+            
+            client_ip = self._get_client_ip()
+            if client_ip is None:
+                return jsonify(ok=False, message="Failed to get remote IP. Please disable your VPN or proxy."), 403
+            
+            if self.challenge_rates.get(client_ip) is None:
+                self.challenge_rates[client_ip] = TokenBucket(5, 5 / 60)
+            if not self.challenge_rates[client_ip].allow_request():
+                return jsonify(ok=False, message="Too many requests. Please try again later."), 429
+                
+            
+            token = self._generate_pow_token()
+            
+            return jsonify(ok=True, message="OK", challenge=token), 200
+        except Exception as e:
+            print(f"Internal error while generating POW: {e}")
+            return jsonify(ok=False, message="Internal Server Error"), 500
+
+    def _verify_solution(self, token: str, solution: int) -> bool:
+        try:
+            
+            
+            
+            decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"], audience=TokenAudience.REDIRECT_POW)
+            
+            if decoded["salt"] in self.used_salts:
+                print("Salt already used")
+                return False
+            
+            self.used_salts.add(decoded["salt"])
+            
+            h = hashlib.sha256(f"{decoded["salt"]}{solution}".encode()).digest()
+
+            value = int.from_bytes(h, "big")
+
+            return value < (1 << (256 - decoded["diff"]))
+        except jwt.InvalidTokenError as e:
+            print(f"Invalid proof of work token: {e}")
+            return False
+
+    def _verify_access_token(self, token: str, slug: str):
+        conn, cursor = self._get_db()
+        
+        cursor.execute("SELECT token, slug, expiryTime, uses, maximumUses FROM access_tokens WHERE token = ?", (token,))
+        
+        row = cursor.fetchone()
+        if not row:
+            print(f"Token not found: {token}")
+            return False
+        
+        token_slug = row[1]
+        if token_slug != slug:
+            print(f"Mismatch slugs: {token_slug} {slug}")
+            return False
+        
+        current_uses = row[3]
+        maximum_uses = row[4]
+        
+        expiryTime = row[2]
+        
+        if current_uses >= maximum_uses:
+            print(f"Reached usage limits: {current_uses} > {maximum_uses}")
+            return False
+        
+        # get utc timestamp
+        utc_time = datetime.now(UTC)
+        unix_timestamp = int(utc_time.timestamp())
+        
+        if unix_timestamp > expiryTime:
+            print(f"Expired access: {unix_timestamp} > {expiryTime}")
+            return False
+        
+        # write back
+        cursor.execute("UPDATE access_tokens SET uses = ? WHERE token = ?", (current_uses + 1, token))
+        print(f"Incremented uses to: {current_uses + 1}")
+        
+        conn.commit()
+        conn.close()
+        
+        return True
+
     def _find_redirect_url(self):
         slug_to_find = request.args.get("slug")
+        pow_solution = request.args.get("challenge_solution")
+        pow_token = request.args.get("challenge_token")
+        access_token = request.args.get("access")
+        
+        if slug_to_find is None or slug_to_find == "":
+            return jsonify(ok=False, message="No URL slug specified"), 400
+        
+        try:
+            pow_solution_int = int(pow_solution or "")
+        except ValueError:
+            return jsonify(ok=False, message="No challenge solution"), 400
+        
+        valid_solution = self._verify_solution(pow_token or "", pow_solution_int)
+        
+        if not valid_solution:
+            return jsonify(ok=False, message="Invalid challenge solution"), 403
 
         conn, cursor = self._get_db()
 
-        cursor.execute("SELECT url FROM shortened_urls WHERE slug = ?", (slug_to_find,))
+        cursor.execute("SELECT url, requireAccessToken FROM shortened_urls WHERE slug = ?", (slug_to_find,))
         row = cursor.fetchone()  # fetchone() returns None if no match
 
+
+
         if row:
+            if row[1] != 0:
+                if (access_token is None or access_token == ""):
+                    return jsonify(ok=False, message="Failed to redirect. Please check link and try again."), 401
+                if not self._verify_access_token(access_token, slug_to_find):
+                    return jsonify(ok=False, message="Failed to redirect. Please check link and try again."), 401
+                print("Valid access token found")
+            
             url = row[0]  # url is the first (and only) column selected
             logger.info(f"URL for slug {slug_to_find}: {url}")
-            return jsonify(ok=True, message="URL found", url=url), 200
+            return jsonify(ok=True, message="OK", url=url), 200
         else:
             logger.info(f"No URL found for slug {slug_to_find}")
-            return jsonify(ok=False, message="No URL found"), 404
+            return jsonify(ok=False, message="Failed to redirect. Please check link and try again."), 404
 
         conn.close()
 
     def _create_redirect_url(self):
+        
+        if not self._check_request_valid():
+            return jsonify(ok=False, message="Unauthorized"), 401
+        
         data = request.get_json()
-        if not data:
-            return jsonify(ok=False, message="Missing JSON body"), 400
+        try:
+            
+            redirect_data = CreateRedirectURLValidate(**data)
 
-        url = data.get("url")
-        if not url:
-            return jsonify(ok=False, message="Missing URL"), 400
+            # Now write to database, generate a random slug
 
-        username = data.get("username")
-        password = data.get("password")
-        if not username:
-            return jsonify(ok=False, message="Missing username"), 400
-        if not password:
-            return jsonify(ok=False, message="Missing password"), 400
+            conn, cursor = self._get_db()
+            slug = self._generate_unique_slug(cursor, length=15)
+            cursor.execute(
+                "INSERT INTO shortened_urls (slug, url, requireAccessToken) VALUES (?, ?, ?)", (slug, redirect_data.target, redirect_data.require_access_token)
+            )
+            conn.commit()
+            conn.close()
 
-        if not self._verify_credentials(username, password):
-            return jsonify(ok=False, message="Invalid credentials"), 401
+            return jsonify(ok=True, message="URL created", url=f"/r?q={slug}"), 200
+        except ValidationError as e:
+            return jsonify(ok=False, message=e.errors()), 400
 
-        # Now write to database, generate a random slug
-
-        conn, cursor = self._get_db()
-        slug = self._generate_unique_slug(cursor, length=7)
-        cursor.execute(
-            "INSERT INTO shortened_urls (slug, url) VALUES (?, ?)", (slug, url)
-        )
-        conn.commit()
-        conn.close()
-
-        return jsonify(ok=True, message="URL created", url=f"/r?q={slug}&v2=true"), 200
+    def _create_access_token_url(self):
+        
+        if not self._check_request_valid():
+            return jsonify(ok=False, message="Unauthorized"), 401
+        
+        data = request.get_json()
+        try:
+            at_data = CreateAccessTokenValidate(**data)
+            
+            conn, cursor = self._get_db()
+            
+            cursor.execute("SELECT 1 FROM shortened_urls WHERE slug = ? LIMIT 1", (at_data.target_slug,))
+            
+            if cursor.fetchone() is None:
+                return jsonify(ok=False, message="Target slug does not exist"), 404
+            
+            # generate token 
+            access_token = secrets.token_hex(16)
+            
+            future = datetime.now(timezone.utc) + timedelta(days=at_data.expiry_days)
+            unix_timestamp = int(future.timestamp())
+            
+            #(id INTEGER PRIMARY KEY, token TEXT, slug TEXT, label TEXT, expiryTime INTEGER, maximumUses INTEGER, uses INTEGER)
+            cursor.execute("INSERT INTO access_tokens (token, slug, label, expiryTime, maximumUses, uses) VALUES (?, ?, ?, ?, ?, ?)",
+                           (access_token, at_data.target_slug, at_data.label, unix_timestamp, at_data.maximum_uses, 0))
+            
+            conn.commit()
+            conn.close()
+            
+            return jsonify(ok=True, message="Access token created successfully", token=access_token), 200
+            
+        except ValidationError as e:
+            return jsonify(ok=False, message=e.errors()), 400
+        
+        except Exception as e:
+            print(f"Internal exception: {e}")
+            return jsonify(ok=False, message="Internal Server Error"), 500
 
     def _revoke_token(self):
         if not self._check_request_valid():
@@ -889,17 +1114,50 @@ class App:
             _id = row[0]
             slug = row[1]
             url = row[2]
+            require_access_token = row[3]
             
             item: LinkItem = {
                 "slug": slug,
-                "url": url
+                "url": url,
+                "requires_access_token": require_access_token
             }
             
             returnedData.append(item)
         
         return jsonify(ok=True, message="OK", data=returnedData)
 
+    def _query_access_tokens(self):
+        
+        if not self._check_request_valid():
+            return jsonify(ok=False, message="Unauthorized"), 401
+        
+        conn, cursor = self._get_db()
+        cursor.execute("SELECT * FROM access_tokens")
+        result = cursor.fetchall()
+        conn.close()
+        
+        returnedData: list[AccessTokenItem] = []
+        
+        for row in result:
+            _id = row[0]
+            _token = row[1]
+            slug = row[2]
+            label = row[3]
+            expiry_time = row[4]
+            maximum_uses = row[5]
+            uses = row[6]
             
+            item: AccessTokenItem = {
+                "expiry_time": expiry_time,
+                "label": label,
+                "maximum_uses": maximum_uses,
+                "slug": slug,
+                "uses": uses
+            }
+            
+            returnedData.append(item)
+        
+        return jsonify(ok=True, message="OK", data=returnedData)
             
 
     def _query_worlds(self):
@@ -972,8 +1230,15 @@ class App:
     def _refresh_token(self):
         refresh_token = request.cookies.get("auth")
         
+        if refresh_token is None or refresh_token == "":
+            refresh_token = request.headers.get("Authorization")
+            if refresh_token is not None:
+                if not self.app.debug:
+                    return jsonify(ok=False, message="Authorization header is insecure and use of it is forbidden in production"), 400
+                refresh_token = refresh_token.removeprefix("Bearer ")
+        
         if refresh_token == None or refresh_token == "":
-            return jsonify(ok=False, message="No refresh token provided"), 401
+            return jsonify(ok=False, message="No refresh token provided"), 400
         
         if not self._is_refresh_valid(refresh_token):
             return jsonify(ok=False, message="Refresh token is invalid"), 401
@@ -1004,8 +1269,12 @@ class App:
         token = self._issue_jwt_refresh()
         
         response = jsonify(ok=True, message="Login successful OK")
-        response.set_cookie("auth", token, httponly=True, secure=self.is_prod, samesite="Lax")
         
+        
+        if self.app.debug:
+            response = jsonify(ok=True, message="Login successful OK", token=token)
+            
+        response.set_cookie("auth", token, httponly=True, secure=self.is_prod, samesite="Lax")
         
         return response
 
