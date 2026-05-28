@@ -97,6 +97,7 @@ class AccessTokenItem(TypedDict):
     expiry_time: int
     uses: int
     maximum_uses: int
+    id: int
 
 def human_readable_time(dt: datetime) -> str:
     """
@@ -194,6 +195,9 @@ class App:
         )
         self.app.add_url_rule(
             "/delete_link", view_func=self._on_delete_link, methods=["DELETE"]
+        )
+        self.app.add_url_rule(
+            "/delete_access_token", view_func=self._on_delete_token, methods=["DELETE"]
         )
 
         self.app.add_url_rule(
@@ -953,14 +957,34 @@ class App:
             conn, cursor = self._get_db()
             cursor.execute("DELETE FROM shortened_urls WHERE slug = ?", (slug,))
             conn.commit()
-            cursor.close()
+            conn.close()
         except Exception as e:
             logger.error(f"Failed to delete shortened slug: {e}")
             return jsonify(ok=False, message="Internal server error"), 500
         else:
             logger.info("Successfully deleted shortened URL")
             return jsonify(ok=True, message="OK"), 200
-            
+
+    def _on_delete_token(self):
+        id = request.args.get("id")
+        
+        if not id:
+            return jsonify(ok=False, message="No ID provided"), 400
+        if not self._check_request_valid():
+            return jsonify(ok=False, message="Unauthorized"), 401
+
+        try:
+            conn, cursor = self._get_db()
+            cursor.execute("DELETE FROM access_tokens WHERE id = ?", (id,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Failed to delete internal: {e}")
+            return jsonify(ok=False, message="Internal server error"), 500
+        else:
+            print("Deleted access token")
+            return jsonify(ok=True, message="OK"), 200
+
         
     def _get_auth(self) -> str:
         try:
@@ -1139,7 +1163,7 @@ class App:
         returnedData: list[AccessTokenItem] = []
         
         for row in result:
-            _id = row[0]
+            id = row[0]
             _token = row[1]
             slug = row[2]
             label = row[3]
@@ -1152,7 +1176,8 @@ class App:
                 "label": label,
                 "maximum_uses": maximum_uses,
                 "slug": slug,
-                "uses": uses
+                "uses": uses,
+                "id": id
             }
             
             returnedData.append(item)
